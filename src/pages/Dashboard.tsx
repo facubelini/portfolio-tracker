@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react'
 import { usePortfolios } from '../hooks/usePortfolios'
 import { useTransacciones } from '../hooks/useTransacciones'
 import { useCCL } from '../hooks/useCCL'
-import { usePrecios } from '../hooks/usePrecios'
+import { usePrecios, usePreciosSubyacentes } from '../hooks/usePrecios'
 import { PortfolioTabs } from '../components/dashboard/PortfolioTabs'
 import { ResumenCard } from '../components/dashboard/ResumenCard'
 import { HoldingsTable } from '../components/dashboard/HoldingsTable'
@@ -25,10 +25,30 @@ export function DashboardPage() {
 
   const { data: precios = {} } = usePrecios(tickers, portfolioActual?.tipo ?? 'cedear')
 
+  // Subyacentes US para precio teórico (solo CEDEARs)
+  const tickersSubyacentes = useMemo(() => {
+    if (portfolioActual?.tipo !== 'cedear') return []
+    return tickers // mismo ticker → Yahoo Finance lo busca directo (sin .BA)
+  }, [tickers, portfolioActual?.tipo])
+  const { data: preciosUSA = {} } = usePreciosSubyacentes(tickersSubyacentes)
+
+  // Merge: precio ARS de CEDEAR + precio USD del subyacente
+  const preciosMerged = useMemo(() => {
+    if (portfolioActual?.tipo !== 'cedear') return precios
+    const merged: typeof precios = { ...precios }
+    for (const ticker of tickers) {
+      const usdSub = preciosUSA[ticker]?.usd
+      if (usdSub && !merged[ticker]?.usd) {
+        merged[ticker] = { ...merged[ticker], usd: usdSub }
+      }
+    }
+    return merged
+  }, [precios, preciosUSA, tickers, portfolioActual?.tipo])
+
   const tenencias = useMemo(() => {
     if (!ccl) return []
-    return calcularTenencias(transacciones, precios, ccl, {})
-  }, [transacciones, precios, ccl])
+    return calcularTenencias(transacciones, preciosMerged, ccl, {})
+  }, [transacciones, preciosMerged, ccl])
 
   const resumen = useMemo((): ResumenPortfolio => {
     const valor_ars = tenencias.reduce((s, t) => s + t.valor_actual_ars, 0)
