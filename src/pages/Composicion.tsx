@@ -4,6 +4,7 @@ import { usePortfolios } from '../hooks/usePortfolios'
 import { useTransacciones } from '../hooks/useTransacciones'
 import { usePrecios } from '../hooks/usePrecios'
 import { useCCL } from '../hooks/useCCL'
+import { useInstrumentos } from '../hooks/useInstrumentos'
 import { calcularTenencias } from '../lib/calculations'
 import { PortfolioTabs } from '../components/dashboard/PortfolioTabs'
 import { formatPct, formatUSD } from '../lib/utils'
@@ -18,13 +19,14 @@ export function ComposicionPage() {
 
   const { data: transacciones = [] } = useTransacciones(activeId ?? undefined)
   const { data: ccl } = useCCL()
+  const { data: instrumentos = {} } = useInstrumentos()
   const tickers = useMemo(() => [...new Set(transacciones.map(t => t.ticker))], [transacciones])
   const { data: precios = {} } = usePrecios(tickers, portfolioActual?.tipo ?? 'cedear')
 
   const tenencias = useMemo(() => {
     if (!ccl) return []
-    return calcularTenencias(transacciones, precios, ccl, {})
-  }, [transacciones, precios, ccl])
+    return calcularTenencias(transacciones, precios, ccl, instrumentos)
+  }, [transacciones, precios, ccl, instrumentos])
 
   const porActivo = tenencias.map((t, i) => ({
     name: t.ticker,

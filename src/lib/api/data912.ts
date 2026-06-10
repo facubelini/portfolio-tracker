@@ -1,75 +1,45 @@
-import type { PrecioMercado, CCL } from '../../types'
-
-// data912.com — API pública de CEDEARs, acciones AR, CCL/MEP e histórico.
-// Documentación: https://data912.com
-// Si hay CORS, los endpoints se rutean por la Edge Function de Supabase (/market-proxy).
+// data912.com — API pública, CORS habilitado (verificado: access-control-allow-origin: *)
+// Rutas reales según su openapi.json:
+//   /live/arg_cedears, /live/arg_stocks, /live/usa_stocks, /live/mep, /live/ccl
+//   /historical/cedears/{ticker}, /historical/stocks/{ticker}
 
 const BASE = 'https://data912.com'
 
-// ── Tipos internos ──────────────────────────────────────────────────────────
-
-interface Data912Panel {
-  ticker: string
-  ultimo: number
-  variacion: number
-  // puede tener más campos
+export interface D912Live {
+  symbol: string
+  c: number          // último precio
+  pct_change: number // variación diaria %
+  px_bid: number
+  px_ask: number
+  v: number
 }
 
-interface Data912CCL {
-  ccl: number
-  mep: number
-  fecha: string
+export interface D912Bar {
+  date: string // YYYY-MM-DD
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
-  if (!res.ok) throw new Error(`data912 ${path}: ${res.status}`)
-  return res.json()
-}
-
-// ── Exports ──────────────────────────────────────────────────────────────────
-
-export async function getPrecioCedear(ticker: string): Promise<PrecioMercado> {
-  const data = await get<Data912Panel>(`/api/cedears/${ticker}`)
-  return {
-    ticker,
-    precio_ars: data.ultimo,
-    variacion_dia_pct: data.variacion,
+  if (!res.ok) throw new Error(`data912 ${path}: HTTP ${res.status}`)
+  const json = await res.json()
+  // la API devuelve 200 con {"Error": "..."} para tickers inexistentes
+  if (json && !Array.isArray(json) && typeof json === 'object' && 'Error' in json) {
+    throw new Error(`data912 ${path}: ${(json as { Error: string }).Error}`)
   }
+  return json as T
 }
 
-export async function getPreciosCedears(tickers: string[]): Promise<PrecioMercado[]> {
-  const all = await get<Data912Panel[]>('/api/cedears')
-  const set = new Set(tickers.map(t => t.toUpperCase()))
-  return all
-    .filter(p => set.has(p.ticker.toUpperCase()))
-    .map(p => ({
-      ticker: p.ticker,
-      precio_ars: p.ultimo,
-      variacion_dia_pct: p.variacion,
-    }))
-}
+// Panel completo de CEDEARs en ARS (precio c + pct_change diario)
+export const getPanelCedears = () => get<D912Live[]>('/live/arg_cedears')
 
-export async function getCCLdesdeData912(): Promise<CCL> {
-  const data = await get<Data912CCL>('/api/dolar/ccl')
-  return {
-    valor: data.ccl,
-    fecha: data.fecha,
-    fuente: 'data912/ccl',
-  }
-}
+// Panel de acciones US en USD (subyacentes; no incluye ETFs como SPY)
+export const getPanelUSA = () => get<D912Live[]>('/live/usa_stocks')
 
-export async function getPrecioSubyacenteUS(ticker: string): Promise<PrecioMercado> {
-  const data = await get<Data912Panel>(`/api/usa/${ticker}`)
-  return {
-    ticker,
-    precio_usd: data.ultimo,
-    variacion_dia_pct: data.variacion,
-  }
-}
-
-export async function getHistoricoCedear(ticker: string): Promise<{ fecha: string; cierre: number }[]> {
-  return get(`/api/cedears/${ticker}/historico`)
-}
+// Histórico diario de un CEDEAR en ARS (desde ~2012)
+export const getHistoricoCedear = (ticker: string) =>
+  get<D912Bar[]>(`/historical/cedears/${ticker.toUpperCase()}`)

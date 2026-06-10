@@ -62,6 +62,10 @@ export interface Tenencia {
   peso_cartera: number
   precio_teorico_usd?: number
   descuento_premio_pct?: number
+  variacion_dia_pct?: number
+  cambio_dia_ars?: number
+  cambio_dia_usd?: number
+  ratio_usado?: number
 }
 
 export interface ResumenPortfolio {
@@ -85,6 +89,16 @@ export interface PrecioMercado {
   precio_usd?: number
   variacion_dia_pct?: number
 }
+
+// Mapa ticker → precio actual usado por los cálculos
+export interface PrecioActivo {
+  ars?: number
+  usd?: number
+  varDiaPct?: number
+}
+
+export type MapaPrecios = Record<string, PrecioActivo>
+
 
 export interface CCL {
   valor: number

@@ -1,56 +1,72 @@
 import { useQuery } from '@tanstack/react-query'
-import { getPreciosCedears, getPreciosUSA } from '../lib/api/yahoo'
+import { getPanelCedears, getPanelUSA } from '../lib/api/data912'
 import { getPreciosCripto } from '../lib/api/binance'
-import type { PortfolioTipo } from '../types'
+import type { PortfolioTipo, MapaPrecios } from '../types'
 import { useCCL } from './useCCL'
 
+export const REFRESCO_PRECIOS_MS = 30_000
+
+// Precios en vivo de los activos en cartera (con variación diaria %)
 export function usePrecios(tickers: string[], tipo: PortfolioTipo) {
   const { data: ccl } = useCCL()
 
-  return useQuery<Record<string, { ars?: number; usd?: number }>>({
-    queryKey: ['precios', tipo, tickers],
+  return useQuery<MapaPrecios>({
+    queryKey: ['precios', tipo, [...tickers].sort().join(',')],
     enabled: tickers.length > 0 && !!ccl,
     queryFn: async () => {
+      const map: MapaPrecios = {}
+
       if (tipo === 'cedear') {
-        const precios = await getPreciosCedears(tickers)
-        return Object.fromEntries(
-          precios.map(p => [
-            p.ticker,
-            {
-              ars: p.precio_ars,
-              usd: p.precio_ars && ccl ? p.precio_ars / ccl.valor : undefined,
-            },
-          ])
-        )
+        const panel = await getPanelCedears()
+        const porSymbol = new Map(panel.map(p => [p.symbol.toUpperCase(), p]))
+        for (const t of tickers) {
+          const row = porSymbol.get(t.toUpperCase())
+          if (row?.c) {
+            map[t] = {
+              ars: row.c,
+              usd: ccl ? row.c / ccl.valor : undefined,
+              varDiaPct: row.pct_change,
+            }
+          }
+        }
       } else {
         const precios = await getPreciosCripto(tickers)
-        return Object.fromEntries(
-          precios.map(p => [
-            p.ticker,
-            {
+        for (const p of precios) {
+          if (p.precio_usd != null) {
+            map[p.ticker] = {
               usd: p.precio_usd,
-              ars: p.precio_usd && ccl ? p.precio_usd * ccl.valor : undefined,
-            },
-          ])
-        )
+              ars: ccl ? p.precio_usd * ccl.valor : undefined,
+              varDiaPct: p.variacion_dia_pct,
+            }
+          }
+        }
       }
+
+      return map
     },
-    staleTime: 60_000,
-    refetchInterval: 60_000,
+    staleTime: REFRESCO_PRECIOS_MS,
+    refetchInterval: REFRESCO_PRECIOS_MS,
   })
 }
 
-// Precios de subyacentes US para calcular precio teórico del CEDEAR
+// Precios USD de subyacentes US (para precio teórico del CEDEAR).
+// Nota: el panel usa_stocks de data912 no incluye ETFs (SPY/QQQ); para esos
+// tickers simplemente no se muestra el teórico.
 export function usePreciosSubyacentes(tickers: string[]) {
-  return useQuery<Record<string, { usd?: number }>>({
-    queryKey: ['precios-sub', tickers],
+  return useQuery<MapaPrecios>({
+    queryKey: ['precios-sub', [...tickers].sort().join(',')],
     enabled: tickers.length > 0,
     queryFn: async () => {
-      const precios = await getPreciosUSA(tickers)
-      return Object.fromEntries(
-        precios.map(p => [p.ticker, { usd: p.precio_usd }])
-      )
+      const panel = await getPanelUSA()
+      const porSymbol = new Map(panel.map(p => [p.symbol.toUpperCase(), p]))
+      const map: MapaPrecios = {}
+      for (const t of tickers) {
+        const row = porSymbol.get(t.toUpperCase())
+        if (row?.c) map[t] = { usd: row.c, varDiaPct: row.pct_change }
+      }
+      return map
     },
-    staleTime: 60_000,
+    staleTime: REFRESCO_PRECIOS_MS,
+    refetchInterval: REFRESCO_PRECIOS_MS,
   })
 }

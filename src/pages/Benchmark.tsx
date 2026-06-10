@@ -1,90 +1,118 @@
 import { useState, useMemo } from 'react'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueries } from '@tanstack/react-query'
 import { usePortfolios } from '../hooks/usePortfolios'
 import { useTransacciones } from '../hooks/useTransacciones'
-import { useCCL } from '../hooks/useCCL'
-import { usePrecios } from '../hooks/usePrecios'
-import { calcularTenencias } from '../lib/calculations'
-import { getHistorico, getHistoricoCedear } from '../lib/api/yahoo'
-import { getPreciosCripto } from '../lib/api/binance'
+import { useCCLHistorico } from '../hooks/useCCL'
+import { getHistoricoCedear, type D912Bar } from '../lib/api/data912'
+import { getKlines, type KlineBar } from '../lib/api/binance'
+import { valorEnFecha, type CotizacionDia } from '../lib/api/argentinadatos'
+import { montoCompra, montoVenta } from '../lib/calculations'
 import { PortfolioTabs } from '../components/dashboard/PortfolioTabs'
-import { formatUSD, formatPct, formatARS } from '../lib/utils'
+import { formatUSD, formatPct } from '../lib/utils'
 import { Card, CardHeader, CardTitle } from '../components/ui/Card'
 import type { Transaccion } from '../types'
-import type { OHLCVBar } from '../lib/api/yahoo'
 
-// Método benchmark: replicar cada compra en USD sobre el benchmark a su precio histórico
-// y comparar el valor final. Curva de equity normalizada a base 100.
+// Método "mismos aportes en las mismas fechas": cada compra/venta se replica en el
+// benchmark (SPY para CEDEARs, BTC para cripto) al precio USD de ese día, y se
+// compara la evolución del valor de ambas carteras en USD.
 
-function calcularCurvaEquity(
+interface PuntoUSD {
+  fecha: string // YYYY-MM-DD
+  usd: number
+}
+
+// Última cotización <= fecha (serie asc); si la fecha es anterior al inicio, primer valor
+function crearLookup(serie: PuntoUSD[]): (fecha: string) => number | null {
+  return (fecha: string) => {
+    if (serie.length === 0) return null
+    let lo = 0
+    let hi = serie.length - 1
+    let best = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (serie[mid].fecha <= fecha) {
+        best = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return best === -1 ? serie[0].usd : serie[best].usd
+  }
+}
+
+// CEDEAR en ARS + serie CCL → serie USD
+function cedearAUSD(bars: D912Bar[], serieCCL: CotizacionDia[]): PuntoUSD[] {
+  const out: PuntoUSD[] = []
+  for (const b of bars) {
+    const ccl = valorEnFecha(serieCCL, b.date)
+    if (ccl && b.c > 0) out.push({ fecha: b.date, usd: b.c / ccl })
+  }
+  return out
+}
+
+const klinesAUSD = (bars: KlineBar[]): PuntoUSD[] =>
+  bars.map(k => ({ fecha: k.fecha, usd: k.cierre }))
+
+interface Resultado {
+  curva: { fecha: string; portfolio: number; benchmark: number }[]
+  aportesNetosUSD: number
+  valorPort: number
+  valorBench: number
+}
+
+function calcularReplica(
   transacciones: Transaccion[],
-  historicoPortfolio: Record<string, OHLCVBar[]>,
-  historicoBench: OHLCVBar[],
-  _ccl: number,
-): { fecha: string; portfolio: number; benchmark: number }[] {
-  const compras = transacciones
-    .filter(t => t.tipo === 'compra')
-    .sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime())
+  seriesPort: Record<string, PuntoUSD[]>,
+  serieBench: PuntoUSD[],
+): Resultado | null {
+  const txs = [...transacciones].sort((a, b) => a.fecha.localeCompare(b.fecha))
+  if (txs.length === 0 || serieBench.length === 0) return null
 
-  if (compras.length === 0 || historicoBench.length === 0) return []
+  const lookupBench = crearLookup(serieBench)
+  const lookups = Object.fromEntries(
+    Object.entries(seriesPort).map(([t, s]) => [t, crearLookup(s)]),
+  )
 
-  const fechaInicio = new Date(compras[0].fecha)
+  // Réplica: cada movimiento compra/vende USD equivalentes del benchmark ese día
+  const eventosBench: { fecha: string; deltaUnits: number }[] = []
+  const eventosQty: Record<string, { fecha: string; delta: number }[]> = {}
+  let aportesNetosUSD = 0
 
-  // Precio del benchmark en la fecha de cada compra (o el más cercano)
-  function precioEnFecha(bars: OHLCVBar[], fecha: string): number | null {
-    const ts = new Date(fecha).getTime()
-    let closest = bars.reduce((prev, cur) =>
-      Math.abs(cur.timestamp * 1000 - ts) < Math.abs(prev.timestamp * 1000 - ts) ? cur : prev
-    )
-    return closest?.cierre ?? null
+  for (const tx of txs) {
+    const m = tx.tipo === 'compra' ? montoCompra(tx) : montoVenta(tx)
+    const signo = tx.tipo === 'compra' ? 1 : -1
+    aportesNetosUSD += signo * m.usd
+    const pb = lookupBench(tx.fecha)
+    if (pb) eventosBench.push({ fecha: tx.fecha, deltaUnits: (signo * m.usd) / pb })
+    ;(eventosQty[tx.ticker] ??= []).push({ fecha: tx.fecha, delta: signo * tx.cantidad })
   }
 
-  // Cuántas unidades de benchmark compraríamos con cada aporte
-  let unidadesBench = 0
-  for (const tx of compras) {
-    const costoUSD = (tx.cantidad * tx.precio_unitario + tx.comision) / tx.ccl_snapshot
-    const precioBenchEnFecha = precioEnFecha(historicoBench, tx.fecha)
-    if (precioBenchEnFecha && precioBenchEnFecha > 0) {
-      unidadesBench += costoUSD / precioBenchEnFecha
-    }
-  }
+  const fechaInicio = txs[0].fecha
+  const curva: Resultado['curva'] = []
 
-  // Construir serie diaria desde fecha inicio
-  const serie: { fecha: string; portfolio: number; benchmark: number }[] = []
-  let base100Portfolio: number | null = null
-  let base100Bench: number | null = null
+  for (const bar of serieBench) {
+    if (bar.fecha < fechaInicio) continue
 
-  // Para el portfolio: valor histórico diario de cada tenencia
-  // Simplificación: tomamos el costo acumulado en ARS a cada fecha y el valor de mercado actual
-  // Para la curva correcta necesitaríamos precios diarios de cada ticker; usamos el ratio vs el primer día
+    let units = 0
+    for (const ev of eventosBench) if (ev.fecha <= bar.fecha) units += ev.deltaUnits
 
-  for (const bar of historicoBench) {
-    if (new Date(bar.fecha) < fechaInicio) continue
-    const valorBench = unidadesBench * bar.cierre
-
-    // Valor diario del portfolio: usamos el benchmark del primer ticker disponible como proxy
-    // hasta tener histórico de todos los tickers
-    const firstTicker = Object.keys(historicoPortfolio)[0]
-    const portBars = firstTicker ? historicoPortfolio[firstTicker] : []
-    const portMap = new Map(portBars.map(b => [b.fecha, b.cierre]))
-    const portPrecio = portMap.get(bar.fecha)
-
-    if (!portPrecio) continue
-
-    if (base100Bench === null) {
-      base100Bench = valorBench
-      base100Portfolio = portPrecio
+    let portVal = 0
+    for (const [ticker, evs] of Object.entries(eventosQty)) {
+      let qty = 0
+      for (const ev of evs) if (ev.fecha <= bar.fecha) qty += ev.delta
+      if (qty <= 1e-12) continue
+      const p = lookups[ticker]?.(bar.fecha)
+      if (p) portVal += qty * p
     }
 
-    serie.push({
-      fecha: bar.fecha,
-      portfolio: base100Portfolio ? (portPrecio / base100Portfolio) * 100 : 100,
-      benchmark: base100Bench ? (valorBench / base100Bench) * 100 : 100,
-    })
+    curva.push({ fecha: bar.fecha, portfolio: portVal, benchmark: units * bar.usd })
   }
 
-  return serie
+  const ultimo = curva.at(-1)
+  if (!ultimo) return null
+  return { curva, aportesNetosUSD, valorPort: ultimo.portfolio, valorBench: ultimo.benchmark }
 }
 
 export function BenchmarkPage() {
@@ -92,172 +120,170 @@ export function BenchmarkPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const activeId = selectedId ?? portfolios[0]?.id ?? null
   const portfolioActual = portfolios.find(p => p.id === activeId)
+  const esCripto = portfolioActual?.tipo === 'cripto'
+  const benchTicker = esCripto ? 'BTC' : 'SPY'
 
   const { data: transacciones = [] } = useTransacciones(activeId ?? undefined)
-  const { data: ccl } = useCCL()
   const tickers = useMemo(() => [...new Set(transacciones.map(t => t.ticker))], [transacciones])
-  const { data: precios = {} } = usePrecios(tickers, portfolioActual?.tipo ?? 'cedear')
 
-  const esCripto = portfolioActual?.tipo === 'cripto'
-  const benchmarkTicker = esCripto ? 'BTC' : 'SPY'
+  const { data: serieCCL } = useCCLHistorico()
 
-  const tenencias = useMemo(() => {
-    if (!ccl) return []
-    return calcularTenencias(transacciones, precios, ccl, {})
-  }, [transacciones, precios, ccl])
-
-  const costoTotalUSD = tenencias.reduce((s, t) => s + t.costo_total_usd, 0)
-  const valorActualUSD = tenencias.reduce((s, t) => s + t.valor_actual_usd, 0)
-  const costoTotalARS = tenencias.reduce((s, t) => s + t.costo_total_ars, 0)
-  const valorActualARS = tenencias.reduce((s, t) => s + t.valor_actual_ars, 0)
-  const pnlPctUSD = costoTotalUSD > 0 ? ((valorActualUSD - costoTotalUSD) / costoTotalUSD) * 100 : 0
-  const pnlPctARS = costoTotalARS > 0 ? ((valorActualARS - costoTotalARS) / costoTotalARS) * 100 : 0
-
-  // Histórico del benchmark (SPY o BTC)
-  const { data: historicoBench = [], isLoading: loadingBench } = useQuery({
-    queryKey: ['historico-bench', benchmarkTicker],
-    queryFn: () => esCripto
-      ? getPreciosCripto(['BTC']).then(() => [] as OHLCVBar[]) // BTC histórico: TODO CoinGecko
-      : getHistoricoCedear(benchmarkTicker, '1y'),
-    staleTime: 300_000,
+  const historicosQ = useQueries({
+    queries: tickers.map(t => ({
+      queryKey: ['historico', esCripto ? 'cripto' : 'cedear', t],
+      queryFn: () => (esCripto ? getKlines(`${t}USDT`) : getHistoricoCedear(t)),
+      staleTime: 3_600_000,
+      retry: 1,
+    })),
   })
 
-  // Histórico del primer ticker del portfolio (para curva proxy)
-  const primerTicker = tickers[0]
-  const { data: historicoPortfolio = [] } = useQuery({
-    queryKey: ['historico-portfolio', primerTicker, esCripto],
-    enabled: !!primerTicker,
-    queryFn: () => esCripto
-      ? [] as OHLCVBar[]
-      : getHistoricoCedear(primerTicker, '1y'),
-    staleTime: 300_000,
+  const benchQ = useQuery<KlineBar[] | D912Bar[]>({
+    queryKey: ['historico', esCripto ? 'cripto' : 'cedear', benchTicker],
+    queryFn: () => (esCripto ? getKlines(`${benchTicker}USDT`) : getHistoricoCedear(benchTicker)),
+    staleTime: 3_600_000,
+    retry: 1,
   })
 
-  // Precio actual del benchmark
-  const { data: precioBenchActual } = useQuery({
-    queryKey: ['precio-bench-actual', benchmarkTicker, esCripto],
-    queryFn: async () => {
-      if (esCripto) {
-        const p = await getPreciosCripto(['BTC'])
-        return p[0]?.precio_usd
-      }
-      const bars = await getHistorico(benchmarkTicker, '1mo', '1d')
-      return bars.at(-1)?.cierre
-    },
-    staleTime: 60_000,
-  })
+  const cargando =
+    benchQ.isLoading ||
+    historicosQ.some(q => q.isLoading) ||
+    (!esCripto && !serieCCL)
 
-  // Precio del benchmark en la fecha de la primera compra
-  const primerCompra = useMemo(() =>
-    [...transacciones].filter(t => t.tipo === 'compra')
-      .sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime())[0],
-    [transacciones]
-  )
+  const actualizadoEn = historicosQ.map(q => q.dataUpdatedAt).join('|') + benchQ.dataUpdatedAt
 
-  const precioBenchEnInicio = useMemo(() => {
-    if (!primerCompra || historicoBench.length === 0) return null
-    const ts = new Date(primerCompra.fecha).getTime()
-    return historicoBench.reduce((prev, cur) =>
-      Math.abs(cur.timestamp * 1000 - ts) < Math.abs(prev.timestamp * 1000 - ts) ? cur : prev
-    ).cierre
-  }, [primerCompra, historicoBench])
+  const resultado = useMemo(() => {
+    if (cargando || !benchQ.data) return null
+    if (!esCripto && !serieCCL) return null
 
-  const rendimientoBench = useMemo(() => {
-    if (!precioBenchEnInicio || !precioBenchActual) return null
-    return ((precioBenchActual - precioBenchEnInicio) / precioBenchEnInicio) * 100
-  }, [precioBenchEnInicio, precioBenchActual])
+    const seriesPort: Record<string, PuntoUSD[]> = {}
+    tickers.forEach((t, i) => {
+      const data = historicosQ[i]?.data
+      if (!data) return
+      seriesPort[t] = esCripto
+        ? klinesAUSD(data as KlineBar[])
+        : cedearAUSD(data as D912Bar[], serieCCL!)
+    })
 
-  const alphaPct = rendimientoBench !== null ? pnlPctUSD - rendimientoBench : null
+    const serieBench = esCripto
+      ? klinesAUSD(benchQ.data as KlineBar[])
+      : cedearAUSD(benchQ.data as D912Bar[], serieCCL!)
 
-  // Curva de equity (portfolio vs benchmark, base 100)
-  const curvaData = useMemo(() => {
-    if (historicoBench.length === 0 || historicoPortfolio.length === 0) return []
-    const portMap: Record<string, OHLCVBar[]> = primerTicker ? { [primerTicker]: historicoPortfolio } : {}
-    return calcularCurvaEquity(transacciones, portMap, historicoBench, ccl?.valor ?? 1)
-  }, [transacciones, historicoPortfolio, historicoBench, ccl, primerTicker])
+    return calcularReplica(transacciones, seriesPort, serieBench)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transacciones, tickers, esCripto, serieCCL, cargando, actualizadoEn])
+
+  const retPort = resultado && resultado.aportesNetosUSD > 0
+    ? (resultado.valorPort / resultado.aportesNetosUSD - 1) * 100 : null
+  const retBench = resultado && resultado.aportesNetosUSD > 0
+    ? (resultado.valorBench / resultado.aportesNetosUSD - 1) * 100 : null
+  const alpha = retPort !== null && retBench !== null ? retPort - retBench : null
+
+  const fallidos = historicosQ
+    .map((q, i) => (q.isError ? tickers[i] : null))
+    .filter(Boolean) as string[]
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
       <PortfolioTabs portfolios={portfolios} selected={activeId} onSelect={setSelectedId} />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        <Card>
-          <CardHeader><CardTitle>Mi portfolio USD</CardTitle></CardHeader>
-          <div className="text-xl font-semibold text-gray-100">{formatUSD(valorActualUSD)}</div>
-          <div className={`text-sm mt-1 font-medium ${pnlPctUSD >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-            {formatPct(pnlPctUSD)}
+      {transacciones.length === 0 ? (
+        <div className="text-center py-16 text-gray-500">
+          <div className="text-3xl mb-2">📊</div>
+          <p>Cargá movimientos para comparar contra {benchTicker}.</p>
+        </div>
+      ) : cargando ? (
+        <div className="flex justify-center py-16">
+          <div className="h-7 w-7 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+        </div>
+      ) : !resultado ? (
+        <div className="text-center py-16 text-gray-500 text-sm">
+          No se pudo armar la comparación (sin datos históricos suficientes).
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <Card>
+              <CardHeader><CardTitle>Aportes netos</CardTitle></CardHeader>
+              <div className="text-xl font-semibold text-gray-100">{formatUSD(resultado.aportesNetosUSD)}</div>
+              <div className="text-xs text-gray-500 mt-1">USD invertidos</div>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Mi portfolio</CardTitle></CardHeader>
+              <div className="text-xl font-semibold text-gray-100">{formatUSD(resultado.valorPort)}</div>
+              {retPort !== null && (
+                <div className={`text-sm mt-1 font-medium ${retPort >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {formatPct(retPort)}
+                </div>
+              )}
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Réplica en {benchTicker}</CardTitle></CardHeader>
+              <div className="text-xl font-semibold text-gray-100">{formatUSD(resultado.valorBench)}</div>
+              {retBench !== null && (
+                <div className={`text-sm mt-1 font-medium ${retBench >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {formatPct(retBench)}
+                </div>
+              )}
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Alpha</CardTitle></CardHeader>
+              {alpha !== null ? (
+                <>
+                  <div className={`text-xl font-semibold ${alpha >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {formatPct(alpha)}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">
+                    {alpha >= 0 ? `Le ganás a ${benchTicker}` : `${benchTicker} te gana`}
+                  </div>
+                </>
+              ) : (
+                <div className="text-sm text-gray-500 mt-2">—</div>
+              )}
+            </Card>
           </div>
-        </Card>
-        <Card>
-          <CardHeader><CardTitle>Mi portfolio ARS</CardTitle></CardHeader>
-          <div className="text-xl font-semibold text-gray-100">{formatARS(valorActualARS)}</div>
-          <div className={`text-sm mt-1 font-medium ${pnlPctARS >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-            {formatPct(pnlPctARS)}
-          </div>
-        </Card>
-        <Card>
-          <CardHeader><CardTitle>Benchmark {benchmarkTicker}</CardTitle></CardHeader>
-          <div className="text-xl font-semibold text-gray-100">
-            {rendimientoBench !== null ? formatPct(rendimientoBench) : '—'}
-          </div>
-          <div className="text-xs text-gray-500 mt-1">
-            {primerCompra ? `Desde ${primerCompra.fecha}` : 'Sin datos'}
-          </div>
-        </Card>
-        <Card>
-          <CardHeader><CardTitle>Alpha vs {benchmarkTicker}</CardTitle></CardHeader>
-          {alphaPct !== null ? (
-            <>
-              <div className={`text-xl font-semibold ${alphaPct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {formatPct(alphaPct)}
-              </div>
-              <div className="text-xs text-gray-500 mt-1">
-                {alphaPct >= 0 ? 'Superás el benchmark' : 'Por debajo del benchmark'}
-              </div>
-            </>
-          ) : (
-            <div className="text-sm text-gray-500 mt-2">Calculando…</div>
+
+          {fallidos.length > 0 && (
+            <div className="text-xs text-amber-400 bg-amber-900/20 border border-amber-800 rounded-lg px-3 py-2">
+              Sin histórico para: {fallidos.join(', ')} — esos activos no suman a la curva del portfolio.
+            </div>
           )}
-        </Card>
-      </div>
 
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-        <h2 className="text-sm font-medium text-gray-400 mb-1">
-          Curva de equity — Portfolio vs {benchmarkTicker} (base 100)
-        </h2>
-        <p className="text-xs text-gray-600 mb-4">
-          Portfolio = evolución del primer ticker de la cartera. Benchmark = {benchmarkTicker}.BA vía Yahoo Finance.
-        </p>
-
-        {loadingBench ? (
-          <div className="flex justify-center py-8">
-            <div className="h-5 w-5 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <h2 className="text-sm font-medium text-gray-400 mb-1">
+              Valor en USD — Mi portfolio vs réplica en {benchTicker}
+            </h2>
+            <p className="text-xs text-gray-600 mb-4">
+              Cada movimiento se replica en {benchTicker} al precio USD de ese día
+              {esCripto ? ' (Binance)' : ' (CEDEAR SPY / CCL del día)'}.
+            </p>
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={resultado.curva}>
+                <XAxis
+                  dataKey="fecha"
+                  tick={{ fontSize: 10, fill: '#6b7280' }}
+                  tickFormatter={d => d.slice(2, 7)}
+                  interval="preserveStartEnd"
+                  minTickGap={40}
+                />
+                <YAxis
+                  tick={{ fontSize: 10, fill: '#6b7280' }}
+                  domain={['auto', 'auto']}
+                  tickFormatter={v => `$${Math.round(Number(v)).toLocaleString('en-US')}`}
+                  width={70}
+                />
+                <Tooltip
+                  formatter={(v, name) => [typeof v === 'number' ? formatUSD(v) : v, name]}
+                  labelFormatter={l => `Fecha: ${l}`}
+                  contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
+                />
+                <Legend />
+                <Line type="monotone" dataKey="portfolio" stroke="#3b82f6" strokeWidth={2} dot={false} name="Mi portfolio" />
+                <Line type="monotone" dataKey="benchmark" stroke="#f59e0b" strokeWidth={2} dot={false} name={`Réplica ${benchTicker}`} />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-        ) : curvaData.length < 2 ? (
-          <div className="text-center py-8 text-gray-500 text-sm">
-            Sin suficientes datos históricos. Cargá al menos una transacción para ver la curva.
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height={280}>
-            <LineChart data={curvaData}>
-              <XAxis
-                dataKey="fecha"
-                tick={{ fontSize: 10, fill: '#6b7280' }}
-                tickFormatter={d => d.slice(5)} // MM-DD
-                interval="preserveStartEnd"
-              />
-              <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} domain={['auto', 'auto']} />
-              <Tooltip
-                formatter={(v, name) => [typeof v === 'number' ? `${v.toFixed(1)}` : v, name]}
-                labelFormatter={l => `Fecha: ${l}`}
-              />
-              <Legend />
-              <Line type="monotone" dataKey="portfolio" stroke="#3b82f6" strokeWidth={2} dot={false} name="Mi portfolio" />
-              <Line type="monotone" dataKey="benchmark" stroke="#f59e0b" strokeWidth={2} dot={false} name={benchmarkTicker} />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </div>
+        </>
+      )}
     </div>
   )
 }

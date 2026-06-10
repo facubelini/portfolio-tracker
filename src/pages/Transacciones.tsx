@@ -1,7 +1,8 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { usePortfolios } from '../hooks/usePortfolios'
 import { useTransacciones, useAgregarTransaccion, useEliminarTransaccion } from '../hooks/useTransacciones'
-import { useCCL } from '../hooks/useCCL'
+import { useCCL, useCCLHistorico } from '../hooks/useCCL'
+import { valorEnFecha } from '../lib/api/argentinadatos'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Badge } from '../components/ui/Badge'
@@ -14,6 +15,7 @@ const MONEDAS: Moneda[] = ['ARS', 'USD']
 
 function TransaccionForm({ portfolioId, tipo, onClose }: { portfolioId: string; tipo: 'cedear' | 'cripto'; onClose: () => void }) {
   const { data: ccl } = useCCL()
+  const { data: serieCCL } = useCCLHistorico()
   const agregar = useAgregarTransaccion()
 
   const [form, setForm] = useState({
@@ -28,8 +30,16 @@ function TransaccionForm({ portfolioId, tipo, onClose }: { portfolioId: string; 
     notas: '',
   })
   const [error, setError] = useState('')
+  const [cclManual, setCclManual] = useState(false)
 
   function set(k: string, v: string) { setForm(f => ({ ...f, [k]: v })) }
+
+  // Autocompleta el CCL histórico de la fecha elegida (editable; si lo tocás, no lo piso)
+  useEffect(() => {
+    if (cclManual || !serieCCL) return
+    const v = valorEnFecha(serieCCL, form.fecha)
+    if (v) setForm(f => ({ ...f, ccl_snapshot: v.toFixed(2) }))
+  }, [form.fecha, serieCCL, cclManual])
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -86,8 +96,8 @@ function TransaccionForm({ portfolioId, tipo, onClose }: { portfolioId: string; 
           onChange={e => set('precio_unitario', e.target.value)} required />
         <Input label="Comisión" type="number" step="any" min="0" value={form.comision}
           onChange={e => set('comision', e.target.value)} />
-        <Input label="CCL al momento" type="number" step="any" min="0" value={form.ccl_snapshot}
-          onChange={e => set('ccl_snapshot', e.target.value)} required />
+        <Input label="CCL de la fecha (auto)" type="number" step="any" min="0" value={form.ccl_snapshot}
+          onChange={e => { setCclManual(true); set('ccl_snapshot', e.target.value) }} required />
       </div>
 
       <Input label="Notas (opcional)" value={form.notas} onChange={e => set('notas', e.target.value)} />

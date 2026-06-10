@@ -1,31 +1,14 @@
 import { useState } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { usePortfolios } from '../hooks/usePortfolios'
 import { useCCL } from '../hooks/useCCL'
-import { supabase } from '../lib/supabase'
+import { useDividendos, useAgregarDividendo, useEliminarDividendo } from '../hooks/useDividendos'
 import { PortfolioTabs } from '../components/dashboard/PortfolioTabs'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Badge } from '../components/ui/Badge'
 import { formatARS, formatUSD } from '../lib/utils'
 import { Trash2 } from 'lucide-react'
-import type { Dividendo, Moneda } from '../types'
-
-function useDividendos(portfolioId: string | undefined) {
-  return useQuery({
-    queryKey: ['dividendos', portfolioId],
-    enabled: !!portfolioId,
-    queryFn: async (): Promise<Dividendo[]> => {
-      const { data, error } = await supabase
-        .from('dividendos')
-        .select('*')
-        .eq('portfolio_id', portfolioId!)
-        .order('fecha', { ascending: false })
-      if (error) throw error
-      return data
-    },
-  })
-}
+import type { Moneda } from '../types'
 
 export function DividendosPage() {
   const { data: portfolios = [] } = usePortfolios()
@@ -33,27 +16,12 @@ export function DividendosPage() {
   const activeId = selectedId ?? portfolios[0]?.id ?? null
   const { data: dividendos = [] } = useDividendos(activeId ?? undefined)
   const { data: ccl } = useCCL()
-  const qc = useQueryClient()
+
+  const agregar = useAgregarDividendo(activeId ?? undefined)
+  const eliminar = useEliminarDividendo(activeId ?? undefined)
 
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ ticker: '', fecha: new Date().toISOString().split('T')[0], monto: '', moneda: 'USD' as Moneda })
-
-  const agregar = useMutation({
-    mutationFn: async (d: Omit<Dividendo, 'id'>) => {
-      const { data, error } = await supabase.from('dividendos').insert(d).select().single()
-      if (error) throw error
-      return data
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['dividendos', activeId] }),
-  })
-
-  const eliminar = useMutation({
-    mutationFn: async (id: string) => {
-      const { error } = await supabase.from('dividendos').delete().eq('id', id)
-      if (error) throw error
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['dividendos', activeId] }),
-  })
 
   const totalUSD = dividendos.reduce((s, d) => s + (d.moneda === 'USD' ? d.monto : d.monto / (ccl?.valor ?? 1)), 0)
   const totalARS = dividendos.reduce((s, d) => s + (d.moneda === 'ARS' ? d.monto : d.monto * (ccl?.valor ?? 1)), 0)
@@ -81,7 +49,7 @@ export function DividendosPage() {
 
       {showForm && (
         <form onSubmit={handleSubmit} className="bg-gray-900 border border-gray-700 rounded-xl p-4 flex flex-wrap gap-3 items-end">
-          <Input label="Ticker" value={form.ticker} onChange={e => setForm(f => ({ ...f, ticker: e.target.value }))} required className="w-28" />
+          <Input label="Ticker" value={form.ticker} onChange={e => setForm(f => ({ ...f, ticker: e.target.value.toUpperCase() }))} required className="w-28" />
           <Input label="Fecha" type="date" value={form.fecha} onChange={e => setForm(f => ({ ...f, fecha: e.target.value }))} required />
           <Input label="Monto" type="number" step="any" min="0" value={form.monto} onChange={e => setForm(f => ({ ...f, monto: e.target.value }))} required className="w-28" />
           <div className="flex flex-col gap-1">

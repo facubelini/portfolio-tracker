@@ -74,6 +74,7 @@ export function ResumenCard({ resumen, ccl }: ResumenCardProps) {
         <StatItem
           label=""
           value={resumen.xirr_ars !== undefined ? formatPct(resumen.xirr_ars * 100) : '—'}
+          sub="anualizada"
           positivo={resumen.xirr_ars !== undefined ? resumen.xirr_ars >= 0 : undefined}
         />
       </Card>
@@ -82,9 +83,21 @@ export function ResumenCard({ resumen, ccl }: ResumenCardProps) {
         <StatItem
           label=""
           value={resumen.xirr_usd !== undefined ? formatPct(resumen.xirr_usd * 100) : '—'}
+          sub="anualizada"
           positivo={resumen.xirr_usd !== undefined ? resumen.xirr_usd >= 0 : undefined}
         />
       </Card>
+      {resumen.dividendos_usd > 0 && (
+        <Card>
+          <CardHeader><CardTitle>Dividendos</CardTitle></CardHeader>
+          <StatItem
+            label=""
+            value={formatUSD(resumen.dividendos_usd)}
+            sub={formatARS(resumen.dividendos_ars)}
+            positivo
+          />
+        </Card>
+      )}
     </div>
   )
 }

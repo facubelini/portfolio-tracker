@@ -1,12 +1,17 @@
 import { useState, useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { RefreshCw } from 'lucide-react'
 import { usePortfolios } from '../hooks/usePortfolios'
 import { useTransacciones } from '../hooks/useTransacciones'
 import { useCCL } from '../hooks/useCCL'
 import { usePrecios, usePreciosSubyacentes } from '../hooks/usePrecios'
+import { useInstrumentos } from '../hooks/useInstrumentos'
+import { useDividendos } from '../hooks/useDividendos'
 import { PortfolioTabs } from '../components/dashboard/PortfolioTabs'
 import { ResumenCard } from '../components/dashboard/ResumenCard'
 import { HoldingsTable } from '../components/dashboard/HoldingsTable'
 import { calcularTenencias, calcularXIRR, cashflowsDesdeTransacciones } from '../lib/calculations'
+import { cn } from '../lib/utils'
 import type { ResumenPortfolio } from '../types'
 
 export function DashboardPage() {
@@ -14,41 +19,36 @@ export function DashboardPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const portfolioActual = portfolios.find(p => p.id === (selectedId ?? portfolios[0]?.id)) ?? null
   const activeId = portfolioActual?.id ?? null
+  const tipo = portfolioActual?.tipo ?? 'cedear'
 
+  const qc = useQueryClient()
   const { data: transacciones = [], isLoading: loadingTx } = useTransacciones(activeId ?? undefined)
   const { data: ccl } = useCCL()
+  const { data: instrumentos = {} } = useInstrumentos()
+  const { data: dividendos = [] } = useDividendos(activeId ?? undefined)
 
   const tickers = useMemo(
     () => [...new Set(transacciones.map(t => t.ticker))],
     [transacciones],
   )
 
-  const { data: precios = {} } = usePrecios(tickers, portfolioActual?.tipo ?? 'cedear')
+  const {
+    data: precios = {},
+    dataUpdatedAt,
+    isFetching: fetchingPrecios,
+  } = usePrecios(tickers, tipo)
 
-  // Subyacentes US para precio teórico (solo CEDEARs)
+  // Subyacentes US — solo para CEDEARs (precio teórico / CCL implícito)
   const tickersSubyacentes = useMemo(() => {
-    if (portfolioActual?.tipo !== 'cedear') return []
-    return tickers // mismo ticker → Yahoo Finance lo busca directo (sin .BA)
-  }, [tickers, portfolioActual?.tipo])
-  const { data: preciosUSA = {} } = usePreciosSubyacentes(tickersSubyacentes)
-
-  // Merge: precio ARS de CEDEAR + precio USD del subyacente
-  const preciosMerged = useMemo(() => {
-    if (portfolioActual?.tipo !== 'cedear') return precios
-    const merged: typeof precios = { ...precios }
-    for (const ticker of tickers) {
-      const usdSub = preciosUSA[ticker]?.usd
-      if (usdSub && !merged[ticker]?.usd) {
-        merged[ticker] = { ...merged[ticker], usd: usdSub }
-      }
-    }
-    return merged
-  }, [precios, preciosUSA, tickers, portfolioActual?.tipo])
+    if (tipo !== 'cedear') return []
+    return [...new Set(tickers.map(t => instrumentos[t]?.ticker_subyacente ?? t))]
+  }, [tickers, instrumentos, tipo])
+  const { data: preciosSubyacentes = {} } = usePreciosSubyacentes(tickersSubyacentes)
 
   const tenencias = useMemo(() => {
     if (!ccl) return []
-    return calcularTenencias(transacciones, preciosMerged, ccl, {})
-  }, [transacciones, preciosMerged, ccl])
+    return calcularTenencias(transacciones, precios, ccl, instrumentos, preciosSubyacentes)
+  }, [transacciones, precios, ccl, instrumentos, preciosSubyacentes])
 
   const resumen = useMemo((): ResumenPortfolio => {
     const valor_ars = tenencias.reduce((s, t) => s + t.valor_actual_ars, 0)
@@ -58,13 +58,19 @@ export function DashboardPage() {
     const pnl_ars = valor_ars - costo_ars
     const pnl_usd = valor_usd - costo_usd
 
+    const dividendos_ars = ccl
+      ? dividendos.reduce((s, d) => s + (d.moneda === 'ARS' ? d.monto : d.monto * ccl.valor), 0)
+      : 0
+    const dividendos_usd = ccl
+      ? dividendos.reduce((s, d) => s + (d.moneda === 'USD' ? d.monto : d.monto / ccl.valor), 0)
+      : 0
+
     let xirr_ars: number | undefined
     let xirr_usd: number | undefined
     if (ccl && transacciones.length > 0) {
-      const cfsARS = cashflowsDesdeTransacciones(transacciones, valor_ars, 'ars', [], ccl)
-      const cfsUSD = cashflowsDesdeTransacciones(transacciones, valor_usd, 'usd', [], ccl)
-      xirr_ars = calcularXIRR(cfsARS)
-      xirr_usd = calcularXIRR(cfsUSD)
+      const divs = dividendos.map(d => ({ fecha: d.fecha, monto: d.monto, moneda: d.moneda }))
+      xirr_ars = calcularXIRR(cashflowsDesdeTransacciones(transacciones, valor_ars, 'ars', divs, ccl))
+      xirr_usd = calcularXIRR(cashflowsDesdeTransacciones(transacciones, valor_usd, 'usd', divs, ccl))
     }
 
     return {
@@ -73,10 +79,15 @@ export function DashboardPage() {
       pnl_pct_ars: costo_ars > 0 ? (pnl_ars / costo_ars) * 100 : 0,
       pnl_pct_usd: costo_usd > 0 ? (pnl_usd / costo_usd) * 100 : 0,
       xirr_ars, xirr_usd,
-      dividendos_ars: 0,
-      dividendos_usd: 0,
+      dividendos_ars, dividendos_usd,
     }
-  }, [tenencias, ccl, transacciones])
+  }, [tenencias, ccl, transacciones, dividendos])
+
+  function refrescarPrecios() {
+    qc.invalidateQueries({ queryKey: ['precios'] })
+    qc.invalidateQueries({ queryKey: ['precios-sub'] })
+    qc.invalidateQueries({ queryKey: ['ccl'] })
+  }
 
   if (loadingPortfolios) {
     return (
@@ -93,7 +104,7 @@ export function DashboardPage() {
           <div className="text-4xl mb-3">📂</div>
           <p className="text-lg font-medium text-gray-300 mb-1">Sin portfolios todavía</p>
           <p className="text-sm">Creá tu primer portfolio con el botón "+ Nuevo"</p>
-          <div className="mt-6">
+          <div className="mt-6 flex justify-center">
             <PortfolioTabs portfolios={[]} selected={null} onSelect={setSelectedId} />
           </div>
         </div>
@@ -109,11 +120,21 @@ export function DashboardPage() {
           selected={activeId}
           onSelect={setSelectedId}
         />
-        {ccl && (
-          <span className="text-xs text-gray-500">
-            CCL ${ccl.valor.toFixed(0)} · {ccl.fuente}
-          </span>
-        )}
+        <div className="flex items-center gap-3 text-xs text-gray-500">
+          {ccl && <span>CCL ${ccl.valor.toFixed(0)}</span>}
+          {dataUpdatedAt > 0 && (
+            <span>
+              Actualizado {new Date(dataUpdatedAt).toLocaleTimeString('es-AR')}
+            </span>
+          )}
+          <button
+            onClick={refrescarPrecios}
+            title="Refrescar precios"
+            className="p-1.5 rounded-lg text-gray-400 hover:text-gray-100 hover:bg-gray-800 transition-colors"
+          >
+            <RefreshCw className={cn('w-3.5 h-3.5', fetchingPrecios && 'animate-spin')} />
+          </button>
+        </div>
       </div>
 
       {loadingTx ? (
@@ -126,9 +147,11 @@ export function DashboardPage() {
           <div className="bg-gray-900 border border-gray-800 rounded-xl">
             <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
               <h2 className="text-sm font-medium text-gray-300">Posiciones</h2>
-              <span className="text-xs text-gray-500">{tenencias.length} activos</span>
+              <span className="text-xs text-gray-500">
+                {tenencias.length} activos · precios cada 30s
+              </span>
             </div>
-            <HoldingsTable tenencias={tenencias} tipo={portfolioActual?.tipo ?? 'cedear'} />
+            <HoldingsTable tenencias={tenencias} tipo={tipo} />
           </div>
         </>
       )}
